@@ -1,0 +1,214 @@
+name: Build and deploy to ECS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "complete/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# Prevent overlapping deployments.
+concurrency:
+  group: campaign-practice-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2
+  AWS_ROLE_ARN: arn:aws:iam::680391390765:role/github-campaign-deploy-role
+  ECR_REGISTRY: 680391390765.dkr.ecr.ap-southeast-2.amazonaws.com
+  ECR_REPOSITORY: campaign-practice
+  ECS_CLUSTER: campaign-practice-cluster
+  ECS_SERVICE: campaign-practice-service
+  CONTAINER_NAME: campaign-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    defaults:
+      run:
+        working-directory: complete
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: complete/pom.xml
+
+      - name: Build and run tests
+        run: |
+          chmod +x mvnw
+          ./mvnw -B clean verify
+
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Authenticate Docker to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build and push image
+        env:
+          IMAGE_TAG: ${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build --platform linux/amd64 -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Download current task definition
+        run: |
+          TASK_DEFINITION_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --query taskDefinition \
+            > current-task-definition.json
+
+      - name: Update image in task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: complete/current-task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE_URI }}
+
+      - name: Deploy to ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployed revision
+        env:
+          EXPECTED_TASK_DEFINITION: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          ACTUAL_TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          if [ "$ACTUAL_TASK_DEFINITION" != "$EXPECTED_TASK_DEFINITION" ]; then
+            echo "Deployment did not retain the expected task definition."
+            echo "Expected: $EXPECTED_TASK_DEFINITION"
+            echo "Actual:   $ACTUAL_TASK_DEFINITION"
+            exit 1
+          fi     
+          
+      - name: Find deployed task public IP
+        env:
+          EXPECTED_TASK_DEFINITION: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          TASK_ARNS=$(aws ecs list-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --service-name "$ECS_SERVICE" \
+            --desired-status RUNNING \
+            --query taskArns \
+            --output text)
+
+          if [ -z "$TASK_ARNS" ] || [ "$TASK_ARNS" = "None" ]; then
+            echo "No running tasks found."
+            exit 1
+          fi
+
+          aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks $TASK_ARNS > tasks.json
+
+          ENI_ID=$(jq -r --arg EXPECTED "$EXPECTED_TASK_DEFINITION" '
+            [
+              .tasks[]
+              | select(
+                  .taskDefinitionArn == $EXPECTED
+                  and .lastStatus == "RUNNING"
+                )
+              | .attachments[]?
+              | select(.type == "ElasticNetworkInterface")
+              | .details[]
+              | select(.name == "networkInterfaceId")
+              | .value
+            ][0] // empty
+          ' tasks.json)
+
+          if [ -z "$ENI_ID" ]; then
+            echo "No network interface found for the deployed revision."
+            exit 1
+          fi
+
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+
+          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+            echo "The task has no public IP."
+            exit 1
+          fi
+
+          echo "APP_URL=http://$PUBLIC_IP:8080" >> "$GITHUB_ENV"
+
+      - name: HTTP health check
+        run: |
+          # Allow time for the application to become ready.
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error \
+                --connect-timeout 5 \
+                --max-time 10 \
+                "$APP_URL/actuator/health" \
+                -o health.json; then
+              if jq -e '.status == "UP"' health.json > /dev/null; then
+                echo "Health check passed."
+                exit 0
+              fi
+            fi
+
+            echo "Application not ready; attempt $attempt of 12."
+            sleep 5
+          done
+
+          echo "Health check failed."
+          exit 1
+
+      - name: Application smoke test
+        run: |
+          RESPONSE=$(curl --fail --silent --show-error \
+            --connect-timeout 5 \
+            --max-time 10 \
+            "$APP_URL/")
+
+          EXPECTED="Greetings from Spring Boot!"
+
+          if [ "$RESPONSE" != "$EXPECTED" ]; then
+            echo "Smoke test failed."
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $RESPONSE"
+            exit 1
+          fi
+
+          echo "Smoke test passed."               
